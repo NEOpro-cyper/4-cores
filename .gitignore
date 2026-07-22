@@ -1,0 +1,10 @@
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+.env
+*.log
+*.pid
+server.log
+server.pid
+.vercel
