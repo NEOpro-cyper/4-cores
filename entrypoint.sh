@@ -18,7 +18,7 @@ exec gunicorn \
   --threads ${THREADS} \
   --timeout ${TIMEOUT} \
   --graceful-timeout ${TIMEOUT} \
-  --preload-app \
+  --preload \
   --max-requests 1000 \
   --max-requests-jitter 50 \
   --access-logfile - \
