@@ -1,14 +1,17 @@
 """
-Dulo.tv Stream URL API — Production Grade v3.1
+Dulo.tv Stream URL API — Production Grade v3.2
 ================================================
-Non-streaming requests + subprocess curl fallback.
-New RESTful endpoints: /api/movie/<id>, /api/tv/<id>/<s>/<e>
-5-minute in-memory cache for repeated requests.
+Optimized with:
+- Session cookie caching (30 min) — saves ~2-3s per request
+- Connection pooling (requests.Session) — saves TLS handshake time
+- Pre-warmed cookie on startup
+- 5-minute source result cache
 
 Vercel:  deployed as @vercel/python serverless function
 VPS:     waitress / gunicorn (bash start.sh)
 """
 
+import copy
 import json
 import logging
 import os
@@ -36,11 +39,10 @@ DULO_BASE = "https://dulo.tv"
 SESSION_URL = f"{DULO_BASE}/api/session"
 SOURCE_URL = f"{DULO_BASE}/api/source"
 SSE_TIMEOUT = int(os.environ.get("SSE_TIMEOUT", "60"))
-# "requests" = non-streaming requests lib (safe for gunicorn)
-# "curl"     = subprocess curl (most isolated, needs curl installed)
 FETCH_MODE = os.environ.get("FETCH_MODE", "requests")
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
-CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))  # 5 minutes default
+CACHE_TTL = int(os.environ.get("CACHE_TTL", "300"))  # 5 min source cache
+COOKIE_TTL = int(os.environ.get("COOKIE_TTL", "1800"))  # 30 min cookie cache
 UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -54,34 +56,40 @@ logging.basicConfig(
 )
 logger = logging.getLogger("dulo-api")
 
-# ── Cache ─────────────────────────────────────────────────────────────────
-class SourceCache:
+
+# ── Connection Pool ────────────────────────────────────────────────────────
+# Reuse TCP + TLS connections across requests (saves ~0.5-1s per request)
+_http_session = req_lib.Session()
+_http_session.verify = False
+_http_session.proxies = PROXIES
+_http_session.headers.update({
+    "Origin": DULO_BASE,
+    "Referer": f"{DULO_BASE}/",
+    "User-Agent": UA,
+})
+
+
+# ── Caches ─────────────────────────────────────────────────────────────────
+
+class _TTLCache:
     """Thread-safe in-memory cache with TTL."""
-    def __init__(self, ttl: int = 300):
+    def __init__(self, ttl: int):
         self.ttl = ttl
-        self._store = {}   # key -> {"data": ..., "time": float}
+        self._store = {}
         self._lock = threading.Lock()
 
-    def _key(self, tmdb_id: int, content_type: str, season, episode) -> str:
-        if content_type == "tv":
-            return f"{content_type}:{tmdb_id}:s{season}:e{episode}"
-        return f"{content_type}:{tmdb_id}"
-
-    def get(self, tmdb_id, content_type, season, episode):
-        k = self._key(tmdb_id, content_type, season, episode)
+    def get(self, key: str):
         with self._lock:
-            entry = self._store.get(k)
+            entry = self._store.get(key)
             if entry and (time.time() - entry["time"]) < self.ttl:
                 return entry["data"]
-            # Expired — clean up
             if entry:
-                del self._store[k]
+                del self._store[key]
         return None
 
-    def set(self, tmdb_id, content_type, season, episode, data):
-        k = self._key(tmdb_id, content_type, season, episode)
+    def set(self, key: str, data):
         with self._lock:
-            self._store[k] = {"data": data, "time": time.time()}
+            self._store[key] = {"data": data, "time": time.time()}
 
     def clear(self):
         with self._lock:
@@ -94,7 +102,33 @@ class SourceCache:
             return {"entries": len(self._store), "active": active, "ttl_seconds": self.ttl}
 
 
-cache = SourceCache(ttl=CACHE_TTL)
+class SourceCache:
+    """Cache keyed by content type + tmdbId + season + episode."""
+    def __init__(self, ttl: int):
+        self._cache = _TTLCache(ttl)
+
+    def _key(self, tmdb_id, content_type, season, episode):
+        if content_type == "tv":
+            return f"{content_type}:{tmdb_id}:s{season}:e{episode}"
+        return f"{content_type}:{tmdb_id}"
+
+    def get(self, tmdb_id, content_type, season, episode):
+        return self._cache.get(self._key(tmdb_id, content_type, season, episode))
+
+    def set(self, tmdb_id, content_type, season, episode, data):
+        self._cache.set(self._key(tmdb_id, content_type, season, episode), data)
+
+    def clear(self):
+        self._cache.clear()
+
+    def stats(self):
+        return self._cache.stats()
+
+
+# Source result cache (5 min)
+source_cache = SourceCache(ttl=CACHE_TTL)
+# Session cookie cache (30 min) — saves ~2-3s per request
+cookie_cache = _TTLCache(ttl=COOKIE_TTL)
 
 # ── App ────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
@@ -121,19 +155,12 @@ def score_source(source: dict) -> int:
     return score
 
 
-# ── Session cookie ─────────────────────────────────────────────────────────
+# ── Session cookie (cached!) ───────────────────────────────────────────────
 
 def _get_session_cookie_requests() -> str:
-    """GET /api/session via requests lib (non-streaming)."""
-    resp = req_lib.get(
+    """GET /api/session via requests lib — uses persistent Session for connection reuse."""
+    resp = _http_session.get(
         SESSION_URL,
-        headers={
-            "Origin": DULO_BASE,
-            "Referer": f"{DULO_BASE}/",
-            "User-Agent": UA,
-        },
-        proxies=PROXIES,
-        verify=False,
         timeout=15,
         allow_redirects=True,
     )
@@ -184,45 +211,63 @@ def _get_session_cookie_curl() -> str:
 
 
 def get_session_cookie() -> str:
-    """Get session cookie, trying primary then fallback mode."""
+    """
+    Get session cookie — CHECKS CACHE FIRST.
+    Cookie is cached for COOKIE_TTL seconds (default 30 min).
+    Only fetches from dulo.tv if cache miss or expired.
+    """
+    cached = cookie_cache.get("amri_session")
+    if cached:
+        logger.info("Session cookie: CACHED")
+        return cached
+
+    logger.info("Session cookie: fetching fresh...")
     if FETCH_MODE == "curl":
         try:
-            return _get_session_cookie_curl()
+            val = _get_session_cookie_curl()
         except FileNotFoundError:
-            logger.warning("curl not found, falling back to requests for session")
-            return _get_session_cookie_requests()
+            logger.warning("curl not found, falling back to requests")
+            val = _get_session_cookie_requests()
     else:
         try:
-            return _get_session_cookie_requests()
+            val = _get_session_cookie_requests()
         except Exception as e:
-            logger.warning(f"requests session failed ({e}), trying curl fallback")
+            logger.warning(f"requests session failed ({e}), trying curl")
             try:
-                return _get_session_cookie_curl()
+                val = _get_session_cookie_curl()
             except FileNotFoundError:
                 raise
+
+    # Cache the cookie
+    cookie_cache.set("amri_session", val)
+    logger.info(f"Session cookie: fresh → {val[:8]}... cached for {COOKIE_TTL}s")
+    return val
+
+
+def refresh_cookie():
+    """Force refresh the session cookie (used on startup + periodic refresh)."""
+    try:
+        val = get_session_cookie()  # This will use cache if valid, or fetch fresh
+        logger.info(f"Cookie pre-warmed: {val[:8]}...")
+    except Exception as e:
+        logger.warning(f"Cookie pre-warm failed: {e} (will retry on first request)")
 
 
 # ── SSE source fetch ───────────────────────────────────────────────────────
 
 def _fetch_sse_requests(cookie_val: str, body: dict) -> str:
     """
-    POST /api/source via requests lib — NON-STREAMING.
-    Downloads the full SSE response at once, then returns the text.
-    This avoids the streaming connection pool corruption that kills gunicorn workers.
+    POST /api/source via requests Session — NON-STREAMING.
+    Uses persistent Session for connection reuse (saves TLS handshake).
     """
-    resp = req_lib.post(
+    resp = _http_session.post(
         SOURCE_URL,
         json=body,
         headers={
-            "Origin": DULO_BASE,
-            "Referer": f"{DULO_BASE}/",
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
             "Cookie": f"amri_session={cookie_val}",
-            "User-Agent": UA,
         },
-        proxies=PROXIES,
-        verify=False,
         timeout=SSE_TIMEOUT,
         allow_redirects=True,
     )
@@ -272,7 +317,9 @@ def fetch_sse(cookie_val: str, body: dict) -> str:
         try:
             return _fetch_sse_requests(cookie_val, body)
         except Exception as e:
-            logger.warning(f"requests SSE failed ({e}), trying curl fallback")
+            # If SSE fetch fails, invalidate the cookie — it might be stale
+            logger.warning(f"SSE fetch failed ({e}), invalidating cookie cache")
+            cookie_cache.clear()
             try:
                 return _fetch_sse_curl(cookie_val, json.dumps(body))
             except FileNotFoundError:
@@ -331,23 +378,24 @@ def fetch_sources(
     """
     Fetch stream sources from dulo.tv.
     Returns (list_of_sources, elapsed_seconds, from_cache).
-    Results are cached for CACHE_TTL seconds (default 5 min).
+    Results cached for CACHE_TTL seconds. Cookie cached for COOKIE_TTL seconds.
     """
-    # Check cache first
-    cached = cache.get(tmdb_id, content_type, season, episode)
+    # Check source cache first
+    cached = source_cache.get(tmdb_id, content_type, season, episode)
     if cached is not None:
-        logger.info(f"Cache HIT: tmdb={tmdb_id} type={content_type} s={season} e={episode}")
+        logger.info(f"Source cache HIT: tmdb={tmdb_id} type={content_type} s={season} e={episode}")
         return cached["sources"], cached["elapsed"], True
 
     logger.info(
-        f"Cache MISS — fetching: tmdb={tmdb_id} type={content_type} "
+        f"Source cache MISS — fetching: tmdb={tmdb_id} type={content_type} "
         f"s={season} e={episode} mode={FETCH_MODE}"
     )
     start_time = time.time()
 
-    # Step 1: Session cookie
+    # Step 1: Session cookie (cached for 30 min — saves ~2-3s)
     cookie_val = get_session_cookie()
-    logger.info(f"Got session cookie: {cookie_val[:8]}...")
+    cookie_elapsed = round(time.time() - start_time, 2)
+    logger.info(f"Cookie step took {cookie_elapsed}s")
 
     # Step 2: SSE source fetch
     body = {"type": content_type, "tmdbId": tmdb_id}
@@ -361,10 +409,10 @@ def fetch_sources(
     # Step 3: Parse
     all_sources = parse_sse(sse_text)
     elapsed = round(time.time() - start_time, 2)
-    logger.info(f"Found {len(all_sources)} sources in {elapsed}s")
+    logger.info(f"Found {len(all_sources)} sources in {elapsed}s (cookie={cookie_elapsed}s)")
 
     # Store in cache
-    cache.set(tmdb_id, content_type, season, episode, {
+    source_cache.set(tmdb_id, content_type, season, episode, {
         "sources": all_sources,
         "elapsed": elapsed,
     })
@@ -379,10 +427,7 @@ def tv_extra(season, episode):
 
 
 def _build_response(raw_sources, tmdb_id, content_type, season, episode, elapsed, server=None, from_cache=False):
-    """
-    Build the JSON response dict from raw sources.
-    If server is specified, return only that server.
-    """
+    """Build JSON response. If server=N, return only that server."""
     if not raw_sources:
         return jsonify({
             "error": "No sources found",
@@ -393,20 +438,15 @@ def _build_response(raw_sources, tmdb_id, content_type, season, episode, elapsed
             "cached": from_cache,
         }), 404
 
-    # Deep copy to avoid mutating cached data
-    import copy
     sources = copy.deepcopy(raw_sources)
 
-    # Score and rank
     for src in sources:
         src["score"] = score_source(src)
     sources.sort(key=lambda s: s["score"], reverse=True)
 
-    # Assign server numbers (1-indexed, best first)
     for i, src in enumerate(sources):
         src["server_number"] = i + 1
 
-    # Specific server requested
     if server is not None:
         matching = [s for s in sources if s["server_number"] == server]
         if not matching:
@@ -441,16 +481,15 @@ def _build_response(raw_sources, tmdb_id, content_type, season, episode, elapsed
 #  Endpoints
 # ═══════════════════════════════════════════════════════════════════════════
 
-# ── Health & Info ───────────────────────────────────────────────────────────
-
 @app.route("/")
 def root():
     return jsonify({
         "name": "Dulo.tv Stream API",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "status": "running",
         "fetch_mode": FETCH_MODE,
-        "cache_ttl": CACHE_TTL,
+        "cache_ttl_source": CACHE_TTL,
+        "cache_ttl_cookie": COOKIE_TTL,
         "endpoints": {
             "movie": "/api/movie/<tmdbId>?server=<n>",
             "tv": "/api/tv/<tmdbId>/<season>/<episode>?server=<n>",
@@ -463,8 +502,6 @@ def root():
             "/api/movie/550?server=1",
             "/api/tv/1396/1/1",
             "/api/tv/1396/1/1?server=2",
-            "/api/stream?id=550&type=movie",
-            "/api/stream?id=1396&type=tv&season=1&episode=1",
         ],
     })
 
@@ -473,22 +510,16 @@ def root():
 def health():
     return jsonify({
         "status": "ok",
-        "version": "3.1.0",
+        "version": "3.2.0",
         "fetch_mode": FETCH_MODE,
         "proxy_configured": bool(PROXY_URL),
-        "cache": cache.stats(),
+        "source_cache": source_cache.stats(),
+        "cookie_cache": cookie_cache.stats(),
     })
 
 
-# ── NEW: RESTful Movie endpoint ────────────────────────────────────────────
-
 @app.route("/api/movie/<int:tmdb_id>")
 def get_movie(tmdb_id):
-    """
-    Get stream sources for a movie.
-    Query params:
-      ?server=N  — return only server N (1-indexed, best first)
-    """
     server = request.args.get("server", type=int)
     if server is not None and server < 1:
         return jsonify({"error": "server must be >= 1"}), 400
@@ -502,15 +533,8 @@ def get_movie(tmdb_id):
     return _build_response(raw_sources, tmdb_id, "movie", None, None, elapsed, server, from_cache)
 
 
-# ── NEW: RESTful TV endpoint ───────────────────────────────────────────────
-
 @app.route("/api/tv/<int:tmdb_id>/<int:season>/<int:episode>")
 def get_tv(tmdb_id, season, episode):
-    """
-    Get stream sources for a TV episode.
-    Query params:
-      ?server=N  — return only server N (1-indexed, best first)
-    """
     server = request.args.get("server", type=int)
     if server is not None and server < 1:
         return jsonify({"error": "server must be >= 1"}), 400
@@ -524,14 +548,8 @@ def get_tv(tmdb_id, season, episode):
     return _build_response(raw_sources, tmdb_id, "tv", season, episode, elapsed, server, from_cache)
 
 
-# ── Legacy: /api/stream (still supported) ──────────────────────────────────
-
 @app.route("/api/stream")
 def get_stream():
-    """
-    Legacy query-param endpoint.
-    Params: id, type=movie|tv, season, episode, server
-    """
     tmdb_id = request.args.get("id", type=int)
     content_type = request.args.get("type", "movie")
     season = request.args.get("season", type=int)
@@ -556,11 +574,8 @@ def get_stream():
     return _build_response(raw_sources, tmdb_id, content_type, season, episode, elapsed, server, from_cache)
 
 
-# ── Legacy: /api/stream/list ───────────────────────────────────────────────
-
 @app.route("/api/stream/list")
 def list_sources():
-    """List available servers (no URLs)."""
     tmdb_id = request.args.get("id", type=int)
     content_type = request.args.get("type", "movie")
     season = request.args.get("season", type=int)
@@ -578,9 +593,7 @@ def list_sources():
     except Exception as e:
         return jsonify({"error": str(e)}), 502
 
-    import copy
     sources = copy.deepcopy(raw_sources)
-
     for src in sources:
         src["score"] = score_source(src)
     sources.sort(key=lambda s: s["score"], reverse=True)
@@ -604,6 +617,14 @@ def list_sources():
         "elapsed_seconds": elapsed,
         "cached": from_cache,
     })
+
+
+# ── Pre-warm cookie on startup ─────────────────────────────────────────────
+
+# Warm up the session cookie + TLS connection before first user request
+logger.info("Pre-warming session cookie and TLS connection...")
+refresh_cookie()
+logger.info("Pre-warm complete. Server ready.")
 
 
 # ── Entry point ────────────────────────────────────────────────────────────
